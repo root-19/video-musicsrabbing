@@ -38,6 +38,11 @@ class DownloadController extends Controller
             'cookies_present' => (bool) (config('downloader.cookies') && is_file(config('downloader.cookies'))),
         ];
 
+        // Deno JS runtime (required by modern yt-dlp for YouTube).
+        $deno = dirname($ytdlp) . DIRECTORY_SEPARATOR . 'deno' . (PHP_OS_FAMILY === 'Windows' ? '.exe' : '');
+        $out['deno_path'] = $deno;
+        $out['deno_present'] = is_file($deno);
+
         // Try actually running yt-dlp --version.
         if ($out['proc_open_available'] && $out['ytdlp_exists']) {
             try {
@@ -231,14 +236,34 @@ class DownloadController extends Controller
             mkdir($tmp, 0775, true);
         }
 
+        // Cache dir for the Deno JS runtime (required by modern yt-dlp for
+        // YouTube). Must be writable and not on a noexec mount like /tmp.
+        $denoDir = $tmp . DIRECTORY_SEPARATOR . 'deno';
+        if (! is_dir($denoDir)) {
+            @mkdir($denoDir, 0775, true);
+        }
+
+        // Prepend our bin dir to PATH so yt-dlp auto-discovers deno (and ffmpeg).
+        $binDir = dirname(config('downloader.ytdlp'));
+        $path = $binDir . PATH_SEPARATOR . (getenv('PATH') ?: '');
+
         if (PHP_OS_FAMILY !== 'Windows') {
-            return ['TMP' => $tmp, 'TEMP' => $tmp, 'TMPDIR' => $tmp];
+            return [
+                'TMP' => $tmp,
+                'TEMP' => $tmp,
+                'TMPDIR' => $tmp,
+                'PATH' => $path,
+                'HOME' => $tmp,
+                'DENO_DIR' => $denoDir,
+                'XDG_CACHE_HOME' => $tmp,
+            ];
         }
 
         $env = [
             'TMP' => $tmp,
             'TEMP' => $tmp,
             'TMPDIR' => $tmp,
+            'DENO_DIR' => $denoDir,
         ];
 
         // Forward the core Windows variables the embedded Python needs.
@@ -252,6 +277,9 @@ class DownloadController extends Controller
         if (empty($env['SystemRoot'])) {
             $env['SystemRoot'] = 'C:\\Windows';
         }
+
+        // Ensure our bin dir (deno, ffmpeg) is discoverable on PATH.
+        $env['PATH'] = $path;
 
         return $env;
     }
