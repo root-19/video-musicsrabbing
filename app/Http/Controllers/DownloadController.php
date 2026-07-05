@@ -34,6 +34,8 @@ class DownloadController extends Controller
             'ffmpeg_executable' => is_file($ffmpeg) && is_executable($ffmpeg),
             'tmp_dir' => $tmp,
             'tmp_writable' => is_writable($tmp),
+            'cookies_path' => config('downloader.cookies'),
+            'cookies_present' => (bool) (config('downloader.cookies') && is_file(config('downloader.cookies'))),
         ];
 
         // Try actually running yt-dlp --version.
@@ -69,6 +71,7 @@ class DownloadController extends Controller
             $this->ytdlp(),
             '--no-playlist',
             '--no-warnings',
+            ...$this->authArgs(),
             '-J', // dump single JSON object
             $data['url'],
         ]);
@@ -118,6 +121,7 @@ class DownloadController extends Controller
             '--no-part',
             '--restrict-filenames',
             '--ffmpeg-location', config('downloader.ffmpeg_dir'),
+            ...$this->authArgs(),
             '-o', $output,
         ];
 
@@ -183,6 +187,30 @@ class DownloadController extends Controller
     {
         // Allows using a bare "yt-dlp" that lives on the system PATH.
         return ! str_contains($bin, DIRECTORY_SEPARATOR);
+    }
+
+    /**
+     * Authentication / anti-bot arguments shared by info() and download().
+     * Adds a cookies file (needed to bypass YouTube's "confirm you're not a
+     * bot" check on server IPs) and any configured extractor args.
+     */
+    protected function authArgs(): array
+    {
+        $args = [];
+
+        $cookies = config('downloader.cookies');
+        if ($cookies && is_file($cookies)) {
+            $args[] = '--cookies';
+            $args[] = $cookies;
+        }
+
+        $extractor = trim((string) config('downloader.extractor_args'));
+        if ($extractor !== '') {
+            $args[] = '--extractor-args';
+            $args[] = $extractor;
+        }
+
+        return $args;
     }
 
     /**
