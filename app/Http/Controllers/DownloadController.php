@@ -10,6 +10,52 @@ use Symfony\Component\HttpFoundation\BinaryFileResponse;
 class DownloadController extends Controller
 {
     /**
+     * Diagnostics endpoint: reports whether everything needed to download is
+     * available (proc_open, yt-dlp, ffmpeg, writable temp dir). Open in a
+     * browser after deploying to quickly see what is misconfigured.
+     */
+    public function health()
+    {
+        $ytdlp = config('downloader.ytdlp');
+        $ffmpegDir = config('downloader.ffmpeg_dir');
+        $ffmpeg = rtrim($ffmpegDir, '/\\') . DIRECTORY_SEPARATOR . 'ffmpeg' . (PHP_OS_FAMILY === 'Windows' ? '.exe' : '');
+        $tmp = storage_path('app/tmp');
+        @mkdir($tmp, 0775, true);
+
+        $out = [
+            'os' => PHP_OS_FAMILY,
+            'php_version' => PHP_VERSION,
+            'proc_open_available' => function_exists('proc_open'),
+            'ytdlp_path' => $ytdlp,
+            'ytdlp_exists' => is_file($ytdlp),
+            'ytdlp_executable' => is_file($ytdlp) && is_executable($ytdlp),
+            'ffmpeg_path' => $ffmpeg,
+            'ffmpeg_exists' => is_file($ffmpeg),
+            'ffmpeg_executable' => is_file($ffmpeg) && is_executable($ffmpeg),
+            'tmp_dir' => $tmp,
+            'tmp_writable' => is_writable($tmp),
+        ];
+
+        // Try actually running yt-dlp --version.
+        if ($out['proc_open_available'] && $out['ytdlp_exists']) {
+            try {
+                $r = Process::timeout(30)->env($this->procEnv())->run([$ytdlp, '--version']);
+                $out['ytdlp_run_exit'] = $r->exitCode();
+                $out['ytdlp_run_output'] = trim($r->output());
+                $out['ytdlp_run_error'] = trim($r->errorOutput());
+            } catch (\Throwable $e) {
+                $out['ytdlp_run_exception'] = $e->getMessage();
+            }
+        }
+
+        $out['ready'] = $out['proc_open_available']
+            && ($out['ytdlp_run_exit'] ?? 1) === 0
+            && $out['ffmpeg_exists'];
+
+        return response()->json($out, 200, [], JSON_PRETTY_PRINT);
+    }
+
+    /**
      * Fetch lightweight metadata for a URL (title, thumbnail, duration, etc.)
      * so the frontend can show a preview before downloading.
      */

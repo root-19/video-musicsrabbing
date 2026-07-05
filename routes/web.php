@@ -9,6 +9,7 @@ Route::get('/', function () {
     return Inertia::render('Welcome');
 });
 
+Route::get('/health/media', [DownloadController::class, 'health'])->name('media.health');
 Route::post('/info', [DownloadController::class, 'info'])->name('media.info');
 Route::post('/download', [DownloadController::class, 'download'])->name('media.download');
 
