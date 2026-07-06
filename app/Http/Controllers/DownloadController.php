@@ -107,6 +107,8 @@ class DownloadController extends Controller
         $data = $request->validate([
             'url' => ['required', 'url', 'max:2048'],
             'format' => ['required', 'in:video,audio'],
+            'banner' => ['sometimes', 'boolean'],
+            'voice' => ['sometimes', 'in:none,deep,chipmunk,robot'],
         ]);
 
         $this->sweepOldFiles();
@@ -169,9 +171,120 @@ class DownloadController extends Controller
 
         $file = $files[0];
 
+        // Optionally overlay the banner and/or apply a voice effect with ffmpeg.
+        // Returns a freshly-processed file, or the original if nothing to do.
+        $servePath = $this->applyEffects(
+            $file,
+            $workDir,
+            $data['format'],
+            (bool) ($data['banner'] ?? false),
+            $data['voice'] ?? 'none',
+        );
+
+        // Serve the (possibly processed) file but keep the original, human-friendly
+        // filename that yt-dlp produced from the video title.
         return response()
-            ->download($file, basename($file))
+            ->download($servePath, basename($file))
             ->deleteFileAfterSend(true);
+    }
+
+    /**
+     * Post-process the downloaded file with ffmpeg: burn in the banner overlay
+     * (video only) and/or apply a voice effect. Returns the path to the new
+     * file, or the untouched original when there is nothing to do (or ffmpeg
+     * fails — we would rather hand back the clean download than error out).
+     */
+    protected function applyEffects(string $input, string $workDir, string $format, bool $banner, string $voice): string
+    {
+        $audioFilter = $this->voiceFilter($voice);
+        $wantBanner = $banner && $format === 'video' && is_file((string) config('downloader.banner'));
+
+        // Nothing requested (or banner missing / not applicable to audio).
+        if (! $wantBanner && $audioFilter === null) {
+            return $input;
+        }
+
+        $ext = $format === 'audio' ? 'mp3' : 'mp4';
+        $outFile = $workDir . DIRECTORY_SEPARATOR . 'processed_' . Str::random(8) . '.' . $ext;
+
+        $cmd = [$this->ffmpegBin(), '-y', '-i', $input];
+
+        if ($wantBanner) {
+            $cmd[] = '-i';
+            $cmd[] = config('downloader.banner');
+        }
+
+        if ($format === 'audio') {
+            // Audio-only: apply the voice filter and re-encode to MP3.
+            array_push($cmd, '-af', $audioFilter, '-c:a', 'libmp3lame', '-q:a', '2');
+        } elseif ($wantBanner) {
+            // Stretch the banner to the full video width and a slim fixed
+            // height (a footer bar — wide, not tall) and pin it flush to the
+            // bottom edge. When a voice effect is also requested, route the
+            // audio through the same filtergraph; otherwise copy it untouched.
+            $ratio = max(0.02, min(0.9, (float) config('downloader.banner_height', 0.12)));
+            $parts = [
+                sprintf('[1][0]scale2ref=w=main_w:h=main_h*%s[wm][base]', $ratio),
+                '[base][wm]overlay=0:H-h[v]',
+            ];
+            $maps = ['-map', '[v]'];
+
+            if ($audioFilter !== null) {
+                $parts[] = '[0:a]' . $audioFilter . '[a]';
+                array_push($maps, '-map', '[a]');
+            } else {
+                array_push($maps, '-map', '0:a?');
+            }
+
+            array_push($cmd, '-filter_complex', implode(';', $parts), ...$maps);
+            array_push($cmd, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p');
+            array_push($cmd, '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart');
+        } else {
+            // Video with a voice effect only: keep the video stream as-is and
+            // just re-encode the filtered audio.
+            array_push($cmd, '-af', $audioFilter, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart');
+        }
+
+        $cmd[] = $outFile;
+
+        $result = Process::timeout(config('downloader.timeout'))->env($this->procEnv())->run($cmd);
+
+        if ($result->successful() && is_file($outFile) && filesize($outFile) > 0) {
+            return $outFile;
+        }
+
+        // Fall back to the untouched download so the user still gets their file.
+        @unlink($outFile);
+
+        return $input;
+    }
+
+    /**
+     * ffmpeg audio filter for a voice effect, or null for "none".
+     *
+     * "deep"/"chipmunk" shift the pitch by re-interpreting the sample rate and
+     * then restore the original duration with atempo. "robot" zeroes the phase
+     * with an FFT filter for a monotone, vocoder-like sound. We resample to a
+     * fixed 44.1kHz first so the pitch factor is consistent across sources.
+     */
+    protected function voiceFilter(string $voice): ?string
+    {
+        return match ($voice) {
+            'deep' => 'aresample=44100,asetrate=44100*0.8,aresample=44100,atempo=1.25',
+            'chipmunk' => 'aresample=44100,asetrate=44100*1.5,aresample=44100,atempo=0.6667',
+            'robot' => "afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=0.75",
+            default => null,
+        };
+    }
+
+    /**
+     * Absolute path to the ffmpeg binary inside the configured ffmpeg dir.
+     */
+    protected function ffmpegBin(): string
+    {
+        $dir = rtrim((string) config('downloader.ffmpeg_dir'), '/\\');
+
+        return $dir . DIRECTORY_SEPARATOR . 'ffmpeg' . (PHP_OS_FAMILY === 'Windows' ? '.exe' : '');
     }
 
     /**

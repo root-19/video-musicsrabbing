@@ -21,6 +21,26 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Banner / watermark
+    |--------------------------------------------------------------------------
+    |
+    | PNG image that can optionally be overlaid onto downloaded videos (a
+    | watermark). It is scaled to a fraction of the video width and placed in
+    | the corner the user chooses. Replace public/banner.png with your own art
+    | (transparent PNG recommended) or point DOWNLOADER_BANNER elsewhere.
+    |
+    */
+
+    'banner' => env('DOWNLOADER_BANNER', public_path('banner.png')),
+
+    // Height of the banner footer strip as a fraction of the video height.
+    // The banner is stretched to the full video width and this height, then
+    // pinned flush to the bottom edge — a wide, short footer bar (not a tall
+    // block). 0.12 = 12% of the video height. Tune to taste.
+    'banner_height' => (float) env('DOWNLOADER_BANNER_HEIGHT', 0.12),
+
+    /*
+    |--------------------------------------------------------------------------
     | Cookies (bot-check bypass)
     |--------------------------------------------------------------------------
     |

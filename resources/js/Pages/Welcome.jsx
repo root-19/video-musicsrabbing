@@ -94,6 +94,10 @@ export default function Welcome() {
     const [status, setStatus] = useState('');
     const [error, setError] = useState('');
 
+    // Optional post-processing.
+    const [banner, setBanner] = useState(false);
+    const [voice, setVoice] = useState('none');
+
     const handleDownload = async () => {
         setError('');
         setStatus('');
@@ -114,7 +118,12 @@ export default function Welcome() {
         try {
             const response = await window.axios.post(
                 '/download',
-                { url: link, format },
+                {
+                    url: link,
+                    format,
+                    banner: format === 'video' && banner,
+                    voice,
+                },
                 { responseType: 'blob', timeout: 0 },
             );
 
@@ -283,6 +292,44 @@ export default function Welcome() {
                                             </>
                                         )}
                                     </button>
+                                </div>
+
+                                {/* Optional extras: banner overlay + voice effect */}
+                                <div className="mt-2 grid gap-2 rounded-xl bg-black/20 p-3 sm:grid-cols-2">
+                                    {/* Banner footer (video only) */}
+                                    <div className={`flex flex-col justify-center gap-1 ${format === 'audio' ? 'pointer-events-none opacity-40' : ''}`}>
+                                        <label className="flex cursor-pointer items-center gap-2.5 text-sm font-medium text-slate-300">
+                                            <input
+                                                type="checkbox"
+                                                checked={banner}
+                                                disabled={format === 'audio' || loading}
+                                                onChange={(e) => setBanner(e.target.checked)}
+                                                className="h-4 w-4 rounded border-white/20 bg-black/40 text-fuchsia-500 focus:ring-fuchsia-500 focus:ring-offset-0"
+                                            />
+                                            Add banner footer
+                                        </label>
+                                        <span className="pl-6.5 text-xs text-slate-500">
+                                            Wide strip stretched across the bottom edge
+                                        </span>
+                                    </div>
+
+                                    {/* Voice effect */}
+                                    <div className="flex flex-col gap-2">
+                                        <label className="text-sm font-medium text-slate-300">
+                                            AI voice effect
+                                        </label>
+                                        <select
+                                            value={voice}
+                                            disabled={loading}
+                                            onChange={(e) => setVoice(e.target.value)}
+                                            className="rounded-lg border-0 bg-black/30 py-2 pl-3 pr-8 text-sm text-white ring-1 ring-inset ring-white/10 transition focus:ring-2 focus:ring-fuchsia-500 disabled:opacity-50"
+                                        >
+                                            <option value="none">Original voice</option>
+                                            <option value="deep">Deep</option>
+                                            <option value="chipmunk">Chipmunk (high)</option>
+                                            <option value="robot">Robot</option>
+                                        </select>
+                                    </div>
                                 </div>
                             </div>
 
