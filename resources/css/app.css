@@ -1,3 +1,84 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/*
+ * Trim range sliders
+ * ------------------
+ * The clip editor stacks two <input type="range"> elements on top of each
+ * other so one track can carry both a start and an end handle. The inputs
+ * themselves ignore the pointer (otherwise the top one would swallow every
+ * click) and only the handles are grabbable.
+ */
+.trim-range {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    pointer-events: none;
+}
+
+.trim-range::-webkit-slider-runnable-track {
+    height: 100%;
+    background: transparent;
+    border: none;
+}
+
+.trim-range::-moz-range-track {
+    height: 100%;
+    background: transparent;
+    border: none;
+}
+
+.trim-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    pointer-events: auto;
+    height: 1.25rem;
+    width: 1.25rem;
+    margin-top: 0;
+    border-radius: 9999px;
+    background: #fff;
+    border: 3px solid #d946ef;
+    box-shadow: 0 2px 10px rgba(217, 70, 239, 0.55);
+    cursor: grab;
+    transition: transform 0.12s ease;
+}
+
+.trim-range::-webkit-slider-thumb:active {
+    cursor: grabbing;
+    transform: scale(1.15);
+}
+
+.trim-range::-moz-range-thumb {
+    pointer-events: auto;
+    height: 1.25rem;
+    width: 1.25rem;
+    border-radius: 9999px;
+    background: #fff;
+    border: 3px solid #d946ef;
+    box-shadow: 0 2px 10px rgba(217, 70, 239, 0.55);
+    cursor: grab;
+}
+
+.trim-range:disabled::-webkit-slider-thumb {
+    border-color: #475569;
+    box-shadow: none;
+    cursor: not-allowed;
+}
+
+.trim-range:disabled::-moz-range-thumb {
+    border-color: #475569;
+    box-shadow: none;
+    cursor: not-allowed;
+}
+
+/* The end handle gets the indigo end of the gradient so the two read apart. */
+.trim-range-end::-webkit-slider-thumb {
+    border-color: #6366f1;
+    box-shadow: 0 2px 10px rgba(99, 102, 241, 0.55);
+}
+
+.trim-range-end::-moz-range-thumb {
+    border-color: #6366f1;
+    box-shadow: 0 2px 10px rgba(99, 102, 241, 0.55);
+}

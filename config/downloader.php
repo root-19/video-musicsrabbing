@@ -15,6 +15,11 @@ return [
 
     'ytdlp' => env('YTDLP_PATH', storage_path('app/bin/yt-dlp' . (PHP_OS_FAMILY === 'Windows' ? '.exe' : ''))),
 
+    // youtube-dl (https://github.com/ytdl-org/youtube-dl). When present it is
+    // tried FIRST for YouTube links; yt-dlp remains the fallback so a failure
+    // in either binary never surfaces to the user unless both fail.
+    'youtubedl' => env('YOUTUBEDL_PATH', storage_path('app/bin/youtube-dl' . (PHP_OS_FAMILY === 'Windows' ? '.exe' : ''))),
+
     // Folder that contains ffmpeg / ffprobe. yt-dlp needs this for MP3 extraction
     // and for merging separate video+audio streams into a single MP4.
     'ffmpeg_dir' => env('FFMPEG_DIR', storage_path('app/bin')),
@@ -68,11 +73,46 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Voice.ai text-to-speech (voice-over page)
+    |--------------------------------------------------------------------------
+    |
+    | When an API key is set, the /voice-over page uses the Voice.ai TTS API
+    | (natural-sounding voices) to speak the script. Without a key it falls
+    | back to the local engine (Windows SAPI / espeak-ng). Voice IDs come from
+    | GET https://dev.voice.ai/api/v1/tts/voices.
+    |
+    */
+
+    'voiceai' => [
+        'key' => env('VOICEAI_API_KEY', ''),
+        'endpoint' => env('VOICEAI_TTS_ENDPOINT', 'https://dev.voice.ai/api/v1/tts/speech'),
+        'voices_endpoint' => env('VOICEAI_VOICES_ENDPOINT', 'https://dev.voice.ai/api/v1/tts/voices'),
+        'voices' => [
+            'boy' => env('VOICEAI_VOICE_BOY', 'c9530f8a-dcb5-4db3-aed0-690694247a1a'),   // Matt - American Male
+            'girl' => env('VOICEAI_VOICE_GIRL', 'e16986bd-1ce9-4c1c-88e7-bbe02b1340d1'), // Alicia - American Female
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Temp download directory
     |--------------------------------------------------------------------------
     */
 
     'tmp_dir' => storage_path('app/downloads'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Saved library directory
+    |--------------------------------------------------------------------------
+    |
+    | Where downloads the user chooses to KEEP on the server are filed away, one
+    | sub-directory per folder they create in the UI. Unlike tmp_dir this is
+    | never swept — files stay until they are deleted from the library page.
+    |
+    */
+
+    'library_dir' => env('DOWNLOADER_LIBRARY_DIR', storage_path('app/library')),
 
     /*
     |--------------------------------------------------------------------------
