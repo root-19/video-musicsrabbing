@@ -39,6 +39,41 @@ function formatBytes(bytes) {
 
 const looksLikeUrl = (text) => /^https?:\/\/[^\s.]+\.[^\s]{2,}$/i.test(text.trim());
 
+/**
+ * Turn the server's report of the finished file into a short sentence.
+ *
+ * `result` is what ffprobe measured on the file that was actually produced —
+ * not a repeat of what was requested — so this is the one place that can say
+ * for certain whether the cut and the mute really landed.
+ */
+function describeResult(applied) {
+    if (!applied) return '';
+
+    const measured = applied.result;
+    const bits = [];
+
+    if (measured?.duration) bits.push(`${formatTime(measured.duration)} long`);
+
+    if (measured && typeof measured.has_audio === 'boolean') {
+        bits.push(measured.has_audio ? 'audio kept' : 'no audio (muted)');
+    } else if (applied.muted) {
+        bits.push('muted');
+    }
+
+    if (applied.banner) bits.push('banner added');
+    if (applied.voice && applied.voice !== 'none') bits.push(`${applied.voice} voice`);
+
+    if (bits.length === 0) return '';
+
+    // Flag the one case the user would otherwise have to discover by opening
+    // the file: a mute was asked for but the result still carries audio.
+    const contradiction = applied.muted && measured?.has_audio === true
+        ? ' ⚠ You asked for it muted but the file still has audio — please report this.'
+        : '';
+
+    return ` The file is ${bits.join(', ')}.${contradiction}`;
+}
+
 /** Pull a readable message out of an axios error, blob responses included. */
 async function errorMessage(e, fallback) {
     const data = e?.response?.data;
@@ -200,7 +235,10 @@ export default function Welcome({ folders: initialFolders = [] }) {
     const duration = Math.floor(Number(info?.duration) || 0);
     const hasDuration = duration > 0;
     const clipLength = Math.max(0, end - start);
-    const trimmed = trimOn && hasDuration && (start > 0 || end < duration);
+    // A trim counts only when it actually narrows the clip. Without a known
+    // duration we cannot compare against the end, so any end the user typed
+    // is taken at face value.
+    const trimmed = trimOn && (start > 0 || (end > 0 && (! hasDuration || end < duration)));
 
     /* -------------------------------------------------------------- */
     /* Auto-preview: debounce the URL, then ask the server about it    */
@@ -261,28 +299,33 @@ export default function Welcome({ folders: initialFolders = [] }) {
     /* Trim handlers                                                   */
     /* -------------------------------------------------------------- */
 
+    // Without a known duration (a preview that failed, or a live stream) the
+    // clip can still be typed in by hand — it is just not bounded above.
+    const MAX_SECONDS = 86400;
+
     const commitStart = useCallback(
         (value) => {
-            const v = clamp(Math.round(value), 0, Math.max(0, end - 1));
+            const ceiling = end > 0 ? end - 1 : (hasDuration ? duration - 1 : MAX_SECONDS - 1);
+            const v = clamp(Math.round(value), 0, Math.max(0, ceiling));
             setStart(v);
             setStartText(formatTime(v, duration >= 3600));
         },
-        [end, duration],
+        [end, duration, hasDuration],
     );
 
     const commitEnd = useCallback(
         (value) => {
-            const v = clamp(Math.round(value), start + 1, duration);
+            const v = clamp(Math.round(value), start + 1, hasDuration ? duration : MAX_SECONDS);
             setEnd(v);
             setEndText(formatTime(v, duration >= 3600));
         },
-        [start, duration],
+        [start, duration, hasDuration],
     );
 
     const applyPreset = (seconds) => {
         setTrimOn(true);
         const from = 0;
-        const to = clamp(seconds, 1, duration);
+        const to = clamp(seconds, 1, hasDuration ? duration : MAX_SECONDS);
         setStart(from);
         setEnd(to);
         setStartText(formatTime(from, duration >= 3600));
@@ -293,7 +336,9 @@ export default function Welcome({ folders: initialFolders = [] }) {
         setStart(0);
         setEnd(duration);
         setStartText('0:00');
-        setEndText(formatTime(duration, duration >= 3600));
+        // With no known length there is no end to show; an empty box reads as
+        // "run to the end", which is exactly what an absent end means.
+        setEndText(hasDuration ? formatTime(duration, duration >= 3600) : '');
     };
 
     /* -------------------------------------------------------------- */
@@ -419,7 +464,10 @@ export default function Welcome({ folders: initialFolders = [] }) {
             if (dest) {
                 // Kept on the server: refresh the library and point at it.
                 setFolders(response.data.folders || []);
-                setStatus(`Saved "${response.data.file?.name}" to the "${dest}" folder.`);
+                setStatus(
+                    `Saved "${response.data.file?.name}" to the "${dest}" folder.`
+                    + describeResult(response.data.applied),
+                );
                 libraryRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
             } else {
                 const disposition = response.headers['content-disposition'] || '';
@@ -435,7 +483,14 @@ export default function Welcome({ folders: initialFolders = [] }) {
                 a.remove();
                 URL.revokeObjectURL(blobUrl);
 
-                setStatus('Done! Your file has been saved to your downloads.');
+                let applied = null;
+                try {
+                    applied = JSON.parse(response.headers['x-mediagrab-applied'] || 'null');
+                } catch {
+                    /* the header is a nicety, never required */
+                }
+
+                setStatus('Done! Your file has been saved to your downloads.' + describeResult(applied));
             }
         } catch (e) {
             setError(
@@ -647,156 +702,165 @@ export default function Welcome({ folders: initialFolders = [] }) {
                                             </div>
                                         </div>
 
-                                        {/* -------------------------------- */}
-                                        {/* Clip editor                       */}
-                                        {/* -------------------------------- */}
-                                        <div className="border-t border-white/10 px-4 py-4">
-                                            <div className="flex flex-wrap items-center justify-between gap-3">
-                                                <label className="flex cursor-pointer items-center gap-2.5 text-sm font-semibold text-white">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={trimOn}
-                                                        disabled={!hasDuration || loading}
-                                                        onChange={(e) => {
-                                                            setTrimOn(e.target.checked);
-                                                            if (e.target.checked && end === 0) resetTrim();
-                                                        }}
-                                                        className="h-4 w-4 rounded border-white/20 bg-black/40 text-fuchsia-500 focus:ring-fuchsia-500 focus:ring-offset-0 disabled:opacity-40"
-                                                    />
-                                                    Trim — save only part of this
-                                                </label>
+                                    </div>
+                                )}
 
-                                                {trimOn && hasDuration && (
-                                                    <span className="rounded-full bg-gradient-to-r from-fuchsia-500/20 to-indigo-500/20 px-3 py-1 text-xs font-bold text-fuchsia-200 ring-1 ring-inset ring-fuchsia-500/30">
-                                                        Clip length {formatTime(clipLength)}
-                                                    </span>
-                                                )}
+                                {/* -------------------------------- */}
+                                {/* Clip editor — always reachable,    */}
+                                {/* even when the preview could not    */}
+                                {/* work out the length.               */}
+                                {/* -------------------------------- */}
+                                {url.trim() !== '' && (
+                                <div className="mt-2 rounded-xl bg-black/20 p-4">
+                                    <div className="flex flex-wrap items-center justify-between gap-3">
+                                        <label className="flex cursor-pointer items-center gap-2.5 text-sm font-semibold text-white">
+                                            <input
+                                                type="checkbox"
+                                                checked={trimOn}
+                                                disabled={loading}
+                                                onChange={(e) => {
+                                                    setTrimOn(e.target.checked);
+                                                    if (e.target.checked && end === 0 && hasDuration) resetTrim();
+                                                }}
+                                                className="h-4 w-4 rounded border-white/20 bg-black/40 text-fuchsia-500 focus:ring-fuchsia-500 focus:ring-offset-0 disabled:opacity-40"
+                                            />
+                                            Trim — save only part of this
+                                        </label>
+
+                                        {trimOn && clipLength > 0 && (
+                                            <span className="rounded-full bg-gradient-to-r from-fuchsia-500/20 to-indigo-500/20 px-3 py-1 text-xs font-bold text-fuchsia-200 ring-1 ring-inset ring-fuchsia-500/30">
+                                                Clip length {formatTime(clipLength)}
+                                            </span>
+                                        )}
+                                    </div>
+
+                                    {trimOn && !hasDuration && (
+                                        <p className="mt-2 text-xs text-amber-400/80">
+                                            This link’s length is unknown (no preview, or a live stream), so there is no
+                                            slider — type the start and end below and the clip is cut to that window.
+                                        </p>
+                                    )}
+
+                                    {trimOn && (
+                                        <div className="mt-4">
+                                            {/* Dual-handle track — only meaningful with a known length */}
+                                            {hasDuration && (
+                                            <>
+                                            <div className="relative h-8 select-none">
+                                                <div className="absolute top-1/2 h-1.5 w-full -translate-y-1/2 rounded-full bg-white/10" />
+                                                <div
+                                                    className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-gradient-to-r from-fuchsia-500 to-indigo-500"
+                                                    style={{ left: `${startPct}%`, right: `${100 - endPct}%` }}
+                                                />
+                                                <input
+                                                    type="range"
+                                                    min={0}
+                                                    max={duration}
+                                                    step={1}
+                                                    value={start}
+                                                    disabled={loading}
+                                                    onChange={(e) => commitStart(Number(e.target.value))}
+                                                    aria-label="Clip start"
+                                                    className="trim-range absolute inset-0 h-8 w-full"
+                                                />
+                                                <input
+                                                    type="range"
+                                                    min={0}
+                                                    max={duration}
+                                                    step={1}
+                                                    value={end}
+                                                    disabled={loading}
+                                                    onChange={(e) => commitEnd(Number(e.target.value))}
+                                                    aria-label="Clip end"
+                                                    className="trim-range trim-range-end absolute inset-0 h-8 w-full"
+                                                />
                                             </div>
 
-                                            {!hasDuration && (
-                                                <p className="mt-2 text-xs text-slate-500">
-                                                    This link has no known length (it may be a live stream), so trimming is
-                                                    unavailable — the whole thing will be saved.
-                                                </p>
+                                            <div className="mt-1 flex justify-between text-[11px] text-slate-500">
+                                                <span>0:00</span>
+                                                <span>{formatTime(duration)}</span>
+                                            </div>
+                                            </>
                                             )}
 
-                                            {trimOn && hasDuration && (
-                                                <div className="mt-4">
-                                                    {/* Dual-handle track */}
-                                                    <div className="relative h-8 select-none">
-                                                        <div className="absolute top-1/2 h-1.5 w-full -translate-y-1/2 rounded-full bg-white/10" />
-                                                        <div
-                                                            className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-gradient-to-r from-fuchsia-500 to-indigo-500"
-                                                            style={{ left: `${startPct}%`, right: `${100 - endPct}%` }}
-                                                        />
-                                                        <input
-                                                            type="range"
-                                                            min={0}
-                                                            max={duration}
-                                                            step={1}
-                                                            value={start}
-                                                            disabled={loading}
-                                                            onChange={(e) => commitStart(Number(e.target.value))}
-                                                            aria-label="Clip start"
-                                                            className="trim-range absolute inset-0 h-8 w-full"
-                                                        />
-                                                        <input
-                                                            type="range"
-                                                            min={0}
-                                                            max={duration}
-                                                            step={1}
-                                                            value={end}
-                                                            disabled={loading}
-                                                            onChange={(e) => commitEnd(Number(e.target.value))}
-                                                            aria-label="Clip end"
-                                                            className="trim-range trim-range-end absolute inset-0 h-8 w-full"
-                                                        />
-                                                    </div>
+                                            {/* Exact timestamps */}
+                                            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                                                <label className="block">
+                                                    <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                                        Start at
+                                                    </span>
+                                                    <input
+                                                        type="text"
+                                                        inputMode="numeric"
+                                                        value={startText}
+                                                        disabled={loading}
+                                                        onChange={(e) => setStartText(e.target.value)}
+                                                        onBlur={() => {
+                                                            const parsed = parseTime(startText);
+                                                            parsed === null
+                                                                ? setStartText(formatTime(start, duration >= 3600))
+                                                                : commitStart(parsed);
+                                                        }}
+                                                        onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+                                                        placeholder="0:00"
+                                                        className="mt-1 w-full rounded-lg border-0 bg-black/40 py-2.5 px-3 font-mono text-sm text-white ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-fuchsia-500"
+                                                    />
+                                                </label>
+                                                <label className="block">
+                                                    <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                                        End at
+                                                    </span>
+                                                    <input
+                                                        type="text"
+                                                        inputMode="numeric"
+                                                        value={endText}
+                                                        disabled={loading}
+                                                        onChange={(e) => setEndText(e.target.value)}
+                                                        onBlur={() => {
+                                                            const parsed = parseTime(endText);
+                                                            parsed === null
+                                                                ? setEndText(formatTime(end, duration >= 3600))
+                                                                : commitEnd(parsed);
+                                                        }}
+                                                        onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+                                                        placeholder={formatTime(duration)}
+                                                        className="mt-1 w-full rounded-lg border-0 bg-black/40 py-2.5 px-3 font-mono text-sm text-white ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-fuchsia-500"
+                                                    />
+                                                </label>
+                                            </div>
 
-                                                    <div className="mt-1 flex justify-between text-[11px] text-slate-500">
-                                                        <span>0:00</span>
-                                                        <span>{formatTime(duration)}</span>
-                                                    </div>
+                                            <p className="mt-2 text-[11px] text-slate-500">
+                                                Type minutes and seconds like <span className="font-mono">1:30</span>, or
+                                                plain seconds like <span className="font-mono">90</span>.
+                                            </p>
 
-                                                    {/* Exact timestamps */}
-                                                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                                                        <label className="block">
-                                                            <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                                                                Start at
-                                                            </span>
-                                                            <input
-                                                                type="text"
-                                                                inputMode="numeric"
-                                                                value={startText}
-                                                                disabled={loading}
-                                                                onChange={(e) => setStartText(e.target.value)}
-                                                                onBlur={() => {
-                                                                    const parsed = parseTime(startText);
-                                                                    parsed === null
-                                                                        ? setStartText(formatTime(start, duration >= 3600))
-                                                                        : commitStart(parsed);
-                                                                }}
-                                                                onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-                                                                placeholder="0:00"
-                                                                className="mt-1 w-full rounded-lg border-0 bg-black/40 py-2.5 px-3 font-mono text-sm text-white ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-fuchsia-500"
-                                                            />
-                                                        </label>
-                                                        <label className="block">
-                                                            <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                                                                End at
-                                                            </span>
-                                                            <input
-                                                                type="text"
-                                                                inputMode="numeric"
-                                                                value={endText}
-                                                                disabled={loading}
-                                                                onChange={(e) => setEndText(e.target.value)}
-                                                                onBlur={() => {
-                                                                    const parsed = parseTime(endText);
-                                                                    parsed === null
-                                                                        ? setEndText(formatTime(end, duration >= 3600))
-                                                                        : commitEnd(parsed);
-                                                                }}
-                                                                onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-                                                                placeholder={formatTime(duration)}
-                                                                className="mt-1 w-full rounded-lg border-0 bg-black/40 py-2.5 px-3 font-mono text-sm text-white ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-fuchsia-500"
-                                                            />
-                                                        </label>
-                                                    </div>
-
-                                                    <p className="mt-2 text-[11px] text-slate-500">
-                                                        Type minutes and seconds like <span className="font-mono">1:30</span>, or
-                                                        plain seconds like <span className="font-mono">90</span>.
-                                                    </p>
-
-                                                    {/* Presets */}
-                                                    <div className="mt-3 flex flex-wrap gap-2">
-                                                        {[15, 30, 60, 180].map((s) =>
-                                                            s < duration ? (
-                                                                <button
-                                                                    key={s}
-                                                                    type="button"
-                                                                    disabled={loading}
-                                                                    onClick={() => applyPreset(s)}
-                                                                    className="rounded-lg bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-300 ring-1 ring-inset ring-white/10 transition hover:bg-white/10 hover:text-white"
-                                                                >
-                                                                    First {s < 60 ? `${s}s` : `${s / 60} min`}
-                                                                </button>
-                                                            ) : null,
-                                                        )}
+                                            {/* Presets */}
+                                            <div className="mt-3 flex flex-wrap gap-2">
+                                                {[15, 30, 60, 180].map((s) =>
+                                                    !hasDuration || s < duration ? (
                                                         <button
+                                                            key={s}
                                                             type="button"
                                                             disabled={loading}
-                                                            onClick={resetTrim}
+                                                            onClick={() => applyPreset(s)}
                                                             className="rounded-lg bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-300 ring-1 ring-inset ring-white/10 transition hover:bg-white/10 hover:text-white"
                                                         >
-                                                            Whole video
+                                                            First {s < 60 ? `${s}s` : `${s / 60} min`}
                                                         </button>
-                                                    </div>
-                                                </div>
-                                            )}
+                                                    ) : null,
+                                                )}
+                                                <button
+                                                    type="button"
+                                                    disabled={loading}
+                                                    onClick={resetTrim}
+                                                    className="rounded-lg bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-300 ring-1 ring-inset ring-white/10 transition hover:bg-white/10 hover:text-white"
+                                                >
+                                                    Whole video
+                                                </button>
+                                            </div>
                                         </div>
-                                    </div>
+                                    )}
+                                </div>
                                 )}
 
                                 {/* ------------------------------------------ */}
@@ -933,6 +997,8 @@ export default function Welcome({ folders: initialFolders = [] }) {
                                             </svg>
                                             {dest ? `Save to "${dest}"` : 'Download'}
                                             {trimmed ? ` · ${formatTime(clipLength)} clip` : ''}
+                                            {format === 'video' && mute ? ' · muted' : ''}
+                                            {format === 'video' && banner ? ' · banner' : ''}
                                         </>
                                     )}
                                 </button>

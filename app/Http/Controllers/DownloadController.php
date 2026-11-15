@@ -70,9 +70,49 @@ class DownloadController extends Controller
             }
         }
 
+        // Trimming and muting live or die by ffmpeg, so prove it actually runs
+        // AND can encode H.264 — a cut needs a re-encode, and an ffmpeg build
+        // without libx264 fails only at that point, long after downloads look
+        // healthy. This is the check that explains "my clip came back uncut".
+        if ($out['proc_open_available'] && $out['ffmpeg_exists']) {
+            try {
+                $r = Process::timeout(60)->env($this->procEnv())->run([$ffmpeg, '-version']);
+                $out['ffmpeg_run_exit'] = $r->exitCode();
+                $out['ffmpeg_version'] = trim(strtok($r->output(), "\n") ?: '');
+
+                // Encode two seconds of colour bars to nowhere. If this passes,
+                // every trim/mute the app performs will pass too.
+                $probe = Process::timeout(120)->env($this->procEnv())->run([
+                    $ffmpeg, '-y',
+                    '-f', 'lavfi', '-i', 'testsrc=size=160x120:rate=10:duration=2',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                    '-f', 'null', '-',
+                ]);
+
+                $out['ffmpeg_can_encode_h264'] = $probe->successful();
+
+                if (! $probe->successful()) {
+                    $out['ffmpeg_encode_error'] = $this->cleanError($probe->errorOutput());
+                }
+            } catch (\Throwable $e) {
+                $out['ffmpeg_run_exception'] = $e->getMessage();
+                $out['ffmpeg_can_encode_h264'] = false;
+            }
+        } else {
+            $out['ffmpeg_can_encode_h264'] = false;
+        }
+
         $out['ready'] = $out['proc_open_available']
             && ($out['ytdlp_run_exit'] ?? 1) === 0
             && $out['ffmpeg_exists'];
+
+        // Downloads can work while editing does not, so report them apart.
+        $out['editing_ready'] = (bool) $out['ffmpeg_can_encode_h264'];
+
+        if (! $out['editing_ready']) {
+            $out['editing_hint'] = 'Trim and mute need a working ffmpeg with libx264. '
+                . 'Run: bash install-media-binaries.sh';
+        }
 
         return response()->json($out, 200, [], JSON_PRETTY_PRINT);
     }
@@ -213,11 +253,35 @@ class DownloadController extends Controller
             'mute' => (bool) ($data['mute'] ?? false),
             'start' => $start !== null ? (float) $start : null,
             'end' => $end !== null ? (float) $end : null,
-        ]);
+        ], $editError);
+
+        // The media came down fine but the edit did not go through. Say so
+        // instead of serving the whole, unedited file as if nothing had been
+        // asked for — that is indistinguishable from the feature being broken.
+        if ($servePath === null) {
+            $this->rmdir($workDir);
+
+            abort(422, 'The download worked, but editing it failed, so nothing was saved. '
+                . 'Open /health/media to check ffmpeg on this server. Details: '
+                . $this->cleanError((string) $editError));
+        }
 
         // Keep the original, human-friendly filename yt-dlp built from the
         // video title, but make sure the extension matches what we produced.
         $name = $this->outputName(basename($file), basename($servePath));
+
+        // What was asked for, and what the finished file actually turned out
+        // to be. Reporting the measured result — not just an echo of the
+        // request — is what lets the page say "5s, no audio" with confidence.
+        $applied = [
+            'trimmed' => $start !== null || $end !== null,
+            'start' => $start !== null ? (float) $start : null,
+            'end' => $end !== null ? (float) $end : null,
+            'muted' => $data['format'] === 'video' && (bool) ($data['mute'] ?? false),
+            'banner' => $data['format'] === 'video' && (bool) ($data['banner'] ?? false),
+            'voice' => $data['voice'] ?? 'none',
+            'result' => $this->probe($servePath),
+        ];
 
         // Saving into a library folder: copy it there and answer with JSON so
         // the page can refresh the folder list and play the file in place.
@@ -229,12 +293,18 @@ class DownloadController extends Controller
                 'saved' => true,
                 'message' => 'Saved to "' . $folder . '".',
                 'file' => $saved,
+                'applied' => $applied,
                 'folders' => LibraryController::folders(),
             ]);
         }
 
+        // A streamed file has no JSON body to carry the outcome, so it rides
+        // along in a header the page reads back.
         return response()
-            ->download($servePath, $name)
+            ->download($servePath, $name, [
+                'X-MediaGrab-Applied' => json_encode($applied),
+                'Access-Control-Expose-Headers' => 'X-MediaGrab-Applied',
+            ])
             ->deleteFileAfterSend(true);
     }
 
@@ -262,10 +332,18 @@ class DownloadController extends Controller
      * the untouched original when there is nothing to do (or ffmpeg fails — we
      * would rather hand back the clean download than error out).
      *
+     * Returns the path to the processed file, the untouched original when
+     * nothing was asked for, or NULL when ffmpeg failed — in which case
+     * $error carries the reason. A failure is never papered over: handing back
+     * the full, unedited file would look exactly like the trim and mute
+     * options doing nothing at all.
+     *
      * @param  array{banner?: bool, voice?: string, mute?: bool, start?: ?float, end?: ?float}  $opts
      */
-    protected function applyEffects(string $input, string $workDir, string $format, array $opts): string
+    protected function applyEffects(string $input, string $workDir, string $format, array $opts, ?string &$error = null): ?string
     {
+        $error = null;
+
         $mute = (bool) ($opts['mute'] ?? false);
         $start = $opts['start'] ?? null;
         $end = $opts['end'] ?? null;
@@ -289,10 +367,19 @@ class DownloadController extends Controller
             return $input;
         }
 
+        // Catch the commonest production fault early and by name, rather than
+        // letting ffmpeg fail obscurely further down.
+        $ffmpeg = $this->ffmpegBin();
+        if (! is_file($ffmpeg)) {
+            $error = 'ffmpeg is not installed on the server. Expected it at: ' . $ffmpeg;
+
+            return null;
+        }
+
         $ext = $format === 'audio' ? 'mp3' : 'mp4';
         $outFile = $workDir . DIRECTORY_SEPARATOR . 'processed_' . Str::random(8) . '.' . $ext;
 
-        $cmd = [$this->ffmpegBin(), '-y'];
+        $cmd = [$ffmpeg, '-y'];
 
         // Seek BEFORE -i so ffmpeg jumps straight to the start of the clip
         // (fast) instead of decoding everything up to it. It applies to the
@@ -375,16 +462,79 @@ class DownloadController extends Controller
 
         $cmd[] = $outFile;
 
-        $result = Process::timeout(config('downloader.timeout'))->env($this->procEnv())->run($cmd);
+        try {
+            $result = Process::timeout(config('downloader.timeout'))->env($this->procEnv())->run($cmd);
+        } catch (\Throwable $e) {
+            // Symfony throws when the binary cannot be executed at all.
+            @unlink($outFile);
+            $error = 'ffmpeg could not be started: ' . $e->getMessage();
+
+            return null;
+        }
 
         if ($result->successful() && is_file($outFile) && filesize($outFile) > 0) {
             return $outFile;
         }
 
-        // Fall back to the untouched download so the user still gets their file.
+        // Do NOT quietly hand back the untouched download: the user explicitly
+        // asked for a cut / silent / branded file, and silently giving them the
+        // full original one instead looks like the feature simply does nothing.
+        $error = trim($result->errorOutput()) ?: trim($result->output()) ?: 'ffmpeg exited with code ' . $result->exitCode() . '.';
+
         @unlink($outFile);
 
-        return $input;
+        return null;
+    }
+
+    /**
+     * Absolute path to ffprobe, alongside ffmpeg.
+     */
+    protected function ffprobeBin(): string
+    {
+        $dir = rtrim((string) config('downloader.ffmpeg_dir'), '/\\');
+
+        return $dir . DIRECTORY_SEPARATOR . 'ffprobe' . (PHP_OS_FAMILY === 'Windows' ? '.exe' : '');
+    }
+
+    /**
+     * Measure what we are actually about to hand over — real length, real
+     * presence of an audio track — so the page can state the outcome instead
+     * of merely echoing back what was requested. Returns null if ffprobe is
+     * unavailable; it is a nicety, never a reason to fail a download.
+     *
+     * @return array{duration: ?float, has_audio: bool}|null
+     */
+    protected function probe(string $path): ?array
+    {
+        $ffprobe = $this->ffprobeBin();
+
+        if (! is_file($ffprobe)) {
+            return null;
+        }
+
+        try {
+            $result = Process::timeout(60)->env($this->procEnv())->run([
+                $ffprobe, '-v', 'error',
+                '-show_entries', 'format=duration:stream=codec_type',
+                '-of', 'json', $path,
+            ]);
+
+            if (! $result->successful()) {
+                return null;
+            }
+
+            $json = json_decode($result->output(), true) ?: [];
+            $streams = array_map(fn ($s) => $s['codec_type'] ?? '', $json['streams'] ?? []);
+
+            return [
+                'duration' => isset($json['format']['duration'])
+                    ? round((float) $json['format']['duration'], 2)
+                    : null,
+                'has_audio' => in_array('audio', $streams, true),
+            ];
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**
