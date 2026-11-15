@@ -80,12 +80,15 @@ class DownloadController extends Controller
                 $out['ffmpeg_run_exit'] = $r->exitCode();
                 $out['ffmpeg_version'] = trim(strtok($r->output(), "\n") ?: '');
 
-                // Encode two seconds of colour bars to nowhere. If this passes,
-                // every trim/mute the app performs will pass too.
+                // Encode two seconds of colour bars to nowhere — at a REAL
+                // video size. A postage-stamp test passes even where x264
+                // cannot open an encoder for an actual clip, which is exactly
+                // the failure this endpoint exists to catch, so the frame size
+                // and the thread cap here mirror what a download really does.
                 $probe = Process::timeout(120)->env($this->procEnv())->run([
                     $ffmpeg, '-y',
-                    '-f', 'lavfi', '-i', 'testsrc=size=160x120:rate=10:duration=2',
-                    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                    '-f', 'lavfi', '-i', 'testsrc=size=720x1280:rate=15:duration=2',
+                    ...$this->videoEncoderArgs(),
                     '-f', 'null', '-',
                 ]);
 
@@ -110,8 +113,10 @@ class DownloadController extends Controller
         $out['editing_ready'] = (bool) $out['ffmpeg_can_encode_h264'];
 
         if (! $out['editing_ready']) {
-            $out['editing_hint'] = 'Trim and mute need a working ffmpeg with libx264. '
-                . 'Run: bash install-media-binaries.sh';
+            $out['editing_hint'] = 'Trim and mute need ffmpeg to encode H.264 at real video sizes. '
+                . 'If ffmpeg is installed but this still fails, lower DOWNLOADER_FFMPEG_THREADS '
+                . '(currently ' . (int) config('downloader.ffmpeg_threads', 2) . '); '
+                . 'otherwise run: bash install-media-binaries.sh';
         }
 
         return response()->json($out, 200, [], JSON_PRETTY_PRINT);
@@ -379,6 +384,12 @@ class DownloadController extends Controller
         $ext = $format === 'audio' ? 'mp3' : 'mp4';
         $outFile = $workDir . DIRECTORY_SEPARATOR . 'processed_' . Str::random(8) . '.' . $ext;
 
+        // The command is built as a closure so it can be rebuilt with a
+        // smaller thread pool if the first attempt trips this host's limits.
+        $build = function (int $threads) use (
+            $ffmpeg, $input, $outFile, $format, $start, $duration,
+            $wantBanner, $wantTrim, $mute, $audioFilter
+        ): array {
         $cmd = [$ffmpeg, '-y'];
 
         // Seek BEFORE -i so ffmpeg jumps straight to the start of the clip
@@ -412,7 +423,7 @@ class DownloadController extends Controller
             // needs a re-encode for a frame-accurate cut.
             array_push($cmd, '-an');
             $wantTrim
-                ? array_push($cmd, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p')
+                ? array_push($cmd, ...$this->videoEncoderArgs($threads))
                 : array_push($cmd, '-c:v', 'copy');
             array_push($cmd, '-movflags', '+faststart');
         } elseif ($wantBanner) {
@@ -438,7 +449,7 @@ class DownloadController extends Controller
             }
 
             array_push($cmd, '-filter_complex', implode(';', $parts), ...$maps);
-            array_push($cmd, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p');
+            array_push($cmd, ...$this->videoEncoderArgs($threads));
 
             if (! $mute) {
                 array_push($cmd, '-c:a', 'aac', '-b:a', '192k');
@@ -454,7 +465,7 @@ class DownloadController extends Controller
             }
 
             $wantTrim
-                ? array_push($cmd, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p')
+                ? array_push($cmd, ...$this->videoEncoderArgs($threads))
                 : array_push($cmd, '-c:v', 'copy');
 
             array_push($cmd, '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart');
@@ -462,28 +473,65 @@ class DownloadController extends Controller
 
         $cmd[] = $outFile;
 
-        try {
-            $result = Process::timeout(config('downloader.timeout'))->env($this->procEnv())->run($cmd);
-        } catch (\Throwable $e) {
-            // Symfony throws when the binary cannot be executed at all.
+        return $cmd;
+        };
+
+        $threads = (int) config('downloader.ffmpeg_threads', 2);
+
+        // Try the configured thread count, then once more single-threaded. A
+        // host tighter than this one can still refuse the first attempt, and
+        // one slow encode beats handing back a file that was never edited.
+        foreach (array_unique([$threads, 1]) as $attempt) {
             @unlink($outFile);
-            $error = 'ffmpeg could not be started: ' . $e->getMessage();
 
-            return null;
-        }
+            try {
+                $result = Process::timeout(config('downloader.timeout'))
+                    ->env($this->procEnv())
+                    ->run($build($attempt));
+            } catch (\Throwable $e) {
+                // Symfony throws when the binary cannot be executed at all.
+                @unlink($outFile);
+                $error = 'ffmpeg could not be started: ' . $e->getMessage();
 
-        if ($result->successful() && is_file($outFile) && filesize($outFile) > 0) {
-            return $outFile;
+                return null;
+            }
+
+            if ($result->successful() && is_file($outFile) && filesize($outFile) > 0) {
+                return $outFile;
+            }
+
+            $error = trim($result->errorOutput())
+                ?: trim($result->output())
+                ?: 'ffmpeg exited with code ' . $result->exitCode() . '.';
         }
 
         // Do NOT quietly hand back the untouched download: the user explicitly
         // asked for a cut / silent / branded file, and silently giving them the
         // full original one instead looks like the feature simply does nothing.
-        $error = trim($result->errorOutput()) ?: trim($result->output()) ?: 'ffmpeg exited with code ' . $result->exitCode() . '.';
-
         @unlink($outFile);
 
         return null;
+    }
+
+    /**
+     * The H.264 encoder settings every re-encoding path shares.
+     *
+     * The thread cap is the important part: see config/downloader.php for why
+     * letting x264 pick for itself breaks on shared hosting.
+     *
+     * @return array<int, string>
+     */
+    protected function videoEncoderArgs(?int $threads = null): array
+    {
+        $threads ??= (int) config('downloader.ffmpeg_threads', 2);
+
+        return [
+            '-threads', (string) max(1, $threads),
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '20',
+            '-pix_fmt', 'yuv420p',
+        ];
     }
 
     /**

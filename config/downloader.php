@@ -125,4 +125,23 @@ return [
 
     'timeout' => (int) env('DOWNLOADER_TIMEOUT', 600),
 
+    /*
+    |--------------------------------------------------------------------------
+    | ffmpeg encoder threads
+    |--------------------------------------------------------------------------
+    |
+    | Left to itself, x264 sizes its thread pool from the host's CPU count —
+    | on a big shared machine that means a dozen or more threads, each with
+    | its own set of frame buffers. At real video sizes that overshoots the
+    | per-account memory limit and x264_encoder_open() fails outright with
+    | "Error while opening encoder", which looks for all the world like trim
+    | and mute silently doing nothing.
+    |
+    | Capping the pool fixes it. 2 is comfortably within shared-hosting limits
+    | and still quick at the "veryfast" preset; raise it on a dedicated box.
+    |
+    */
+
+    'ffmpeg_threads' => max(1, (int) env('DOWNLOADER_FFMPEG_THREADS', 2)),
+
 ];
